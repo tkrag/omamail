@@ -87,19 +87,35 @@ integration-test-credentials` — always pass that feature flag, or IMAP/JMAP
 integration tests that exercise real credential storage fail with
 `auth_signed_out` for reasons that have nothing to do with your change.
 
-## Running a dev build against the live Omarchy shell
+## Running a local build against the live Omarchy shell
 
-```sh
-./dev run
-```
+**Use `make install`, not `./dev run`, unless you specifically need the
+`OMAMAIL_BIN` override.** `make install` (→ `install-backend-local`, which
+builds `--release` and runs `python3 scripts/backend-runtime.py
+install-local`, then `scripts/link-plugin.sh`) does three things: builds a
+release binary, installs it as *the* backend Omarchy launches (replacing the
+Marketplace one), and symlinks `~/.config/omarchy/plugins/omamail` to this
+checkout so the QML/JS also comes from here — then restarts the shell for
+you. This is what the Makefile itself calls out as "development only: the
+Marketplace installs the plugin for ordinary users," i.e. the sanctioned way
+to run your own build day to day. Revert with `make install-plugin` (wipes
+the runtime and reinstalls the pinned release fresh) or manually via
+`python3 scripts/backend-runtime.py uninstall`.
 
-This builds the backend and prints an `OMAMAIL_BIN=...` path — it does
-**not** touch the Marketplace-installed runtime. To actually use that build:
-export `OMAMAIL_BIN` in the environment that starts `omarchy-shell`, restart
-the shell through your normal session method, then reopen the plugin with
-`omarchy shell shell toggle omamail '{}'`. `make install` (→
-`install-backend-local` + `scripts/link-plugin.sh`) swaps in a dev build more
-persistently; `make install-plugin` resets to a clean installed state.
+`./dev run` only builds a debug binary and prints `OMAMAIL_BIN=<path>` — it
+changes nothing by itself. That variable has to reach the **Quickshell
+process's own environment** (`ui/Service.qml` reads it via
+`Quickshell.env("OMAMAIL_BIN")`), and `omarchy restart shell` deliberately
+launches the shell through Hyprland (`hyprctl dispatch
+'hl.dsp.exec_cmd("omarchy-launch-shell")'`) specifically so it inherits "the
+canonical session environment, not transient variables from a terminal" (see
+`omarchy-restart-shell`'s own comment) — so `export OMAMAIL_BIN=...` in a
+terminal and then restarting the shell does **not** pick it up. Reaching for
+`OMAMAIL_BIN` for real means getting it into Hyprland's own process
+environment (e.g. an `env =` line in the Hyprland config, which needs a
+fresh Hyprland session to take effect) — heavier than it's worth for a
+single test. `make install` sidesteps all of this because the resulting
+binary needs no environment variable at all.
 
 ## IMAP folder model, briefly
 

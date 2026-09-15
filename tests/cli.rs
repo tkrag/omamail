@@ -1447,6 +1447,10 @@ async fn imap_action_preview_requires_discovered_destinations_and_execution_uses
                     writer.write_all(b"* OK ready\r\n").await.unwrap();
                     let mut lists = 0;
                     let mut moves = 0;
+                    let mut creates = 0;
+                    // Archiving routes into the destination's yearly child;
+                    // trashing still moves straight into the resolved folder.
+                    let archiving = operation == "archive";
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).await.unwrap() == 0 {
@@ -1459,11 +1463,7 @@ async fn imap_action_preview_requires_discovered_destinations_and_execution_uses
                         } else if line == "O1 LIST \"\" \"*\"\r\n" {
                             lists += 1;
                             assert_eq!(lists, 1, "execution must consume its planned folder");
-                            let special = if operation == "archive" {
-                                "\\Archive"
-                            } else {
-                                "\\Trash"
-                            };
+                            let special = if archiving { "\\Archive" } else { "\\Trash" };
                             if available {
                                 format!(
                                     "* LIST () \"/\" INBOX\r\n* LIST ({special}) \"/\" \"Shared \\\"store\\\"\"\r\nO1 OK folders\r\n"
@@ -1473,7 +1473,24 @@ async fn imap_action_preview_requires_discovered_destinations_and_execution_uses
                             }
                         } else if execute && line == "O1 SELECT \"INBOX\"\r\n" {
                             "O1 OK selected\r\n".to_owned()
-                        } else if execute && line == "O1 UID MOVE 7 \"Shared \\\"store\\\"\"\r\n" {
+                        } else if execute
+                            && archiving
+                            && line == "O1 UID FETCH 7 (UID INTERNALDATE)\r\n"
+                        {
+                            "O1 OK fetched\r\n".to_owned()
+                        } else if execute
+                            && archiving
+                            && line == "O1 CREATE \"Shared \\\"store\\\"/2026\"\r\n"
+                        {
+                            creates += 1;
+                            "O1 OK created\r\n".to_owned()
+                        } else if execute
+                            && line
+                                == format!(
+                                    "O1 UID MOVE 7 \"Shared \\\"store\\\"{}\"\r\n",
+                                    if archiving { "/2026" } else { "" }
+                                )
+                        {
                             moves += 1;
                             "O1 OK moved\r\n".to_owned()
                         } else {
@@ -1483,6 +1500,7 @@ async fn imap_action_preview_requires_discovered_destinations_and_execution_uses
                     }
                     assert_eq!(lists, 1);
                     assert_eq!(moves, usize::from(execute));
+                    assert_eq!(creates, usize::from(execute && archiving));
                 }
             });
             for execute in if available {
@@ -1579,7 +1597,10 @@ async fn imap_archive_keeps_confirmed_folder_results_when_later_select_refuses()
             } else {
                 commands.push(line.clone());
                 match line.as_str() {
-                    "O1 SELECT \"INBOX\"\r\n" | "O1 UID MOVE 7 \"Archive\"\r\n" => "O1 OK done\r\n",
+                    "O1 SELECT \"INBOX\"\r\n"
+                    | "O1 UID FETCH 7 (UID INTERNALDATE)\r\n"
+                    | "O1 CREATE \"Archive/2026\"\r\n"
+                    | "O1 UID MOVE 7 \"Archive/2026\"\r\n" => "O1 OK done\r\n",
                     "O1 SELECT \"ZOther\"\r\n" => "O1 NO refused\r\n",
                     _ => panic!("unexpected or repeated mutation: {line:?}"),
                 }
@@ -1590,7 +1611,9 @@ async fn imap_archive_keeps_confirmed_folder_results_when_later_select_refuses()
             commands,
             [
                 "O1 SELECT \"INBOX\"\r\n",
-                "O1 UID MOVE 7 \"Archive\"\r\n",
+                "O1 UID FETCH 7 (UID INTERNALDATE)\r\n",
+                "O1 CREATE \"Archive/2026\"\r\n",
+                "O1 UID MOVE 7 \"Archive/2026\"\r\n",
                 "O1 SELECT \"ZOther\"\r\n"
             ]
         );

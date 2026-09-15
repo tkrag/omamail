@@ -1,8 +1,9 @@
 //! Native action planning and submission. Mutations are never retried.
-use super::read::{Mailboxes, mailboxes, message_id, resolve};
+use super::read::{self, Mailboxes, mailboxes, message_id, resolve};
 use super::*;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-use std::collections::BTreeMap;
+use chrono::Datelike;
+use std::collections::{BTreeMap, BTreeSet};
 fn ids(p: &Value) -> Result<BTreeMap<String, Vec<u32>>> {
     let entries = p["ids"].as_array().ok_or("invalid_params")?;
     if entries.len() > 500 {
@@ -133,6 +134,21 @@ async fn append(w: &mut Wire, folder: &str, body: &[u8], flag: &str) -> Result<(
 async fn delete_uid(w: &mut Wire, uid: u32) -> Result<()> {
     command(w, &format!("UID STORE {uid} +FLAGS.SILENT (\\Deleted)")).await?;
     command(w, &format!("UID EXPUNGE {uid}")).await?;
+    Ok(())
+}
+async fn move_uids(w: &mut Wire, can_move: bool, uids: &[u32], target: &str) -> Result<()> {
+    let set = uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if can_move {
+        command(w, &format!("UID MOVE {set} {}", quote(target)?)).await?;
+    } else {
+        command(w, &format!("UID COPY {set} {}", quote(target)?)).await?;
+        command(w, &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)")).await?;
+        command(w, &format!("UID EXPUNGE {set}")).await?;
+    }
     Ok(())
 }
 fn raw(p: &Value) -> Result<Vec<u8>> {
@@ -337,6 +353,10 @@ pub(super) async fn call_planned(
         };
         if let Some(groups) = groups {
             let (add, remove, destination) = plan(method, p, &boxes)?;
+            // Year folders this call already created, so archiving several
+            // source folders into the same year in one batch CREATEs it once
+            // rather than racing itself across groups.
+            let mut created_folders: BTreeSet<String> = BTreeSet::new();
             for (folder, uids) in groups {
                 command(&mut w, &format!("SELECT {}", quote(&folder)?)).await?;
                 let set = uids
@@ -356,20 +376,46 @@ pub(super) async fn call_planned(
                 if let Some(target) = &destination
                     && target != &folder
                 {
-                    if boxes
+                    let can_move = boxes
                         .capabilities
                         .iter()
-                        .any(|v| v.eq_ignore_ascii_case("MOVE"))
-                    {
-                        command(&mut w, &format!("UID MOVE {set} {}", quote(target)?)).await?;
+                        .any(|v| v.eq_ignore_ascii_case("MOVE"));
+                    // Archiving is the one move whose real destination is not
+                    // the resolved folder itself but the yearly child each
+                    // message's own date belongs under — Archives/2019 holds
+                    // 2019 mail regardless of when it was archived, matching
+                    // a long-lived Archives/<year> layout instead of one
+                    // ever-growing mailbox.
+                    if boxes.special.get("\\archive").is_some_and(|a| a == target) {
+                        let data =
+                            command(&mut w, &format!("UID FETCH {set} (UID INTERNALDATE)")).await?;
+                        let years = read::fetch_years(&data)?;
+                        let delimiter = read::delimiter_of(&boxes, target);
+                        let mut buckets: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+                        for uid in &uids {
+                            let year = years
+                                .get(uid)
+                                .copied()
+                                .unwrap_or_else(|| chrono::Utc::now().year());
+                            buckets.entry(year).or_default().push(*uid);
+                        }
+                        for (year, bucket) in buckets {
+                            let child = format!("{target}{delimiter}{year}");
+                            if !created_folders.contains(&child) && !read::exists(&boxes, &child) {
+                                if command(&mut w, &format!("CREATE {}", quote(&child)?))
+                                    .await
+                                    .is_err()
+                                    && !read::folder_listed(&mut w, &child).await?
+                                {
+                                    return Err("imap_folder_unavailable");
+                                }
+                                read::invalidate().await;
+                            }
+                            created_folders.insert(child.clone());
+                            move_uids(&mut w, can_move, &bucket, &child).await?;
+                        }
                     } else {
-                        command(&mut w, &format!("UID COPY {set} {}", quote(target)?)).await?;
-                        command(
-                            &mut w,
-                            &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
-                        )
-                        .await?;
-                        command(&mut w, &format!("UID EXPUNGE {set}")).await?;
+                        move_uids(&mut w, can_move, &uids, target).await?;
                     }
                 }
                 // Record only a fully acknowledged group. Keep the ledger

@@ -89,18 +89,24 @@ async fn planned_group_failure(failure: &str, use_move: bool, flags_only: bool, 
                 .await
                 .unwrap();
         }
-        'groups: for (folder, set) in [("INBOX", "7,9"), ("ZOther", "8")] {
+        'groups: for (folder, set, first) in [("INBOX", "7,9", true), ("ZOther", "8", false)] {
             let mut commands = vec![
                 format!("SELECT \"{folder}\""),
                 format!("UID STORE {set} +FLAGS.SILENT (\\Seen)"),
                 format!("UID STORE {set} -FLAGS.SILENT (\\Flagged)"),
             ];
             if !flags_only {
+                commands.push(format!("UID FETCH {set} (UID INTERNALDATE)"));
+                // The year folder is created once, on the first group that
+                // needs it; a later group in the same batch just reuses it.
+                if first {
+                    commands.push("CREATE \"Archive/2026\"".into());
+                }
                 if use_move {
-                    commands.push(format!("UID MOVE {set} \"Archive\""));
+                    commands.push(format!("UID MOVE {set} \"Archive/2026\""));
                 } else {
                     commands.extend([
-                        format!("UID COPY {set} \"Archive\""),
+                        format!("UID COPY {set} \"Archive/2026\""),
                         format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
                         format!("UID EXPUNGE {set}"),
                     ]);
@@ -149,7 +155,7 @@ async fn planned_group_failure(failure: &str, use_move: bool, flags_only: bool, 
     let context = if flags_only {
         Value::Null
     } else {
-        json!({"folders":[],"special":{"\\archive":"Archive"},"capabilities":if use_move {vec!["MOVE"]} else {vec![]}})
+        json!({"folders":[{"name":"Archive","delimiter":"/","flags":["\\Archive"]}],"special":{"\\archive":"Archive"},"capabilities":if use_move {vec!["MOVE"]} else {vec![]}})
     };
     let result = super::super::execute_planned_action("imap.modify", &p, &context)
         .await
@@ -174,13 +180,14 @@ async fn planned_groups_preserve_acknowledgements_at_every_later_failure_boundar
         "SELECT \"ZOther\"",
         "UID STORE 8 +FLAGS.SILENT (\\Seen)",
         "UID STORE 8 -FLAGS.SILENT (\\Flagged)",
-        "UID COPY 8 \"Archive\"",
+        "UID FETCH 8 (UID INTERNALDATE)",
+        "UID COPY 8 \"Archive/2026\"",
         "UID STORE 8 +FLAGS.SILENT (\\Deleted)",
         "UID EXPUNGE 8",
     ] {
         planned_group_failure(failure, false, false, false).await;
     }
-    planned_group_failure("UID MOVE 8 \"Archive\"", true, false, false).await;
+    planned_group_failure("UID MOVE 8 \"Archive/2026\"", true, false, false).await;
     planned_group_failure("UID STORE 8 -FLAGS.SILENT (\\Flagged)", false, true, false).await;
 }
 
@@ -190,17 +197,38 @@ async fn planned_groups_preserve_acknowledgements_when_later_group_exceeds_deadl
 }
 
 #[tokio::test]
-async fn archive_without_move_sets_flags_then_copy_then_uid_expunge() {
+async fn archive_routes_by_message_year_creating_folder_then_copy_and_expunge() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let peer = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut w: Wire = BufReader::new(Box::new(socket));
         initialize(&mut w).await;
+        assert_eq!(
+            line(&mut w).await.unwrap(),
+            b"O1 SELECT \"INBOX\"\r\n".as_slice()
+        );
+        write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        assert_eq!(
+            line(&mut w).await.unwrap(),
+            b"O1 UID STORE 7 +FLAGS.SILENT (\\Seen)\r\n".as_slice()
+        );
+        write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        // The message is from 2019: a late archive still files it under the
+        // year it was actually received, not the year it was archived in.
+        assert_eq!(
+            line(&mut w).await.unwrap(),
+            b"O1 UID FETCH 7 (UID INTERNALDATE)\r\n".as_slice()
+        );
+        write(
+            &mut w,
+            b"* 1 FETCH (UID 7 INTERNALDATE \"03-Mar-2019 10:00:00 +0000\")\r\nO1 OK done\r\n",
+        )
+        .await
+        .unwrap();
         for wanted in [
-            "O1 SELECT \"INBOX\"\r\n",
-            "O1 UID STORE 7 +FLAGS.SILENT (\\Seen)\r\n",
-            "O1 UID COPY 7 \"Archive\"\r\n",
+            "O1 CREATE \"Archive/2019\"\r\n",
+            "O1 UID COPY 7 \"Archive/2019\"\r\n",
             "O1 UID STORE 7 +FLAGS.SILENT (\\Deleted)\r\n",
             "O1 UID EXPUNGE 7\r\n",
         ] {
@@ -210,6 +238,146 @@ async fn archive_without_move_sets_flags_then_copy_then_uid_expunge() {
     });
     let mut p = params(port);
     p["ids"] = json!(["7:INBOX"]);
+    p["addLabelIds"] = json!([]);
+    p["removeLabelIds"] = json!(["INBOX", "UNREAD"]);
+    super::super::call("imap.modify", &p).await.unwrap();
+    peer.await.unwrap();
+}
+#[tokio::test]
+async fn archive_skips_create_when_the_year_folder_already_exists() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut w: Wire = BufReader::new(Box::new(socket));
+        write(&mut w, b"* OK ready\r\n").await.unwrap();
+        assert!(line(&mut w).await.unwrap().starts_with(b"O1 LOGIN"));
+        write(&mut w, b"O1 OK login\r\n").await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(line(&mut w).await.unwrap(), b"O1 CAPABILITY\r\n");
+            write(&mut w, b"* CAPABILITY IMAP4rev1\r\nO1 OK capabilities\r\n")
+                .await
+                .unwrap();
+        }
+        assert_eq!(line(&mut w).await.unwrap(), b"O1 LIST \"\" \"*\"\r\n");
+        write(&mut w,b"* LIST () \"/\" INBOX\r\n* LIST (\\Archive) \"/\" Archive\r\n* LIST () \"/\" Archive/2026\r\nO1 OK folders\r\n").await.unwrap();
+        for wanted in [
+            "O1 SELECT \"INBOX\"\r\n",
+            "O1 UID STORE 7 +FLAGS.SILENT (\\Seen)\r\n",
+            "O1 UID FETCH 7 (UID INTERNALDATE)\r\n",
+        ] {
+            assert_eq!(line(&mut w).await.unwrap(), wanted.as_bytes());
+            write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        }
+        // Archive/2026 is already listed, so no CREATE is sent for it.
+        for wanted in [
+            "O1 UID COPY 7 \"Archive/2026\"\r\n",
+            "O1 UID STORE 7 +FLAGS.SILENT (\\Deleted)\r\n",
+            "O1 UID EXPUNGE 7\r\n",
+        ] {
+            assert_eq!(line(&mut w).await.unwrap(), wanted.as_bytes());
+            write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        }
+    });
+    let mut p = params(port);
+    p["ids"] = json!(["7:INBOX"]);
+    p["addLabelIds"] = json!([]);
+    p["removeLabelIds"] = json!(["INBOX", "UNREAD"]);
+    super::super::call("imap.modify", &p).await.unwrap();
+    peer.await.unwrap();
+}
+#[tokio::test]
+async fn archive_recovers_when_create_loses_a_race_to_another_archive() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut w: Wire = BufReader::new(Box::new(socket));
+        initialize(&mut w).await;
+        for wanted in [
+            "O1 SELECT \"INBOX\"\r\n",
+            "O1 UID STORE 7 +FLAGS.SILENT (\\Seen)\r\n",
+            "O1 UID FETCH 7 (UID INTERNALDATE)\r\n",
+        ] {
+            assert_eq!(line(&mut w).await.unwrap(), wanted.as_bytes());
+            write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        }
+        // A concurrent archive already created the year folder: CREATE fails,
+        // but a live LIST finds it, and the move still goes through.
+        assert_eq!(
+            line(&mut w).await.unwrap(),
+            b"O1 CREATE \"Archive/2026\"\r\n".as_slice()
+        );
+        write(&mut w, b"O1 NO mailbox already exists\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            line(&mut w).await.unwrap(),
+            b"O1 LIST \"\" \"Archive/2026\"\r\n".as_slice()
+        );
+        write(&mut w, b"* LIST () \"/\" Archive/2026\r\nO1 OK found\r\n")
+            .await
+            .unwrap();
+        for wanted in [
+            "O1 UID COPY 7 \"Archive/2026\"\r\n",
+            "O1 UID STORE 7 +FLAGS.SILENT (\\Deleted)\r\n",
+            "O1 UID EXPUNGE 7\r\n",
+        ] {
+            assert_eq!(line(&mut w).await.unwrap(), wanted.as_bytes());
+            write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        }
+    });
+    let mut p = params(port);
+    p["ids"] = json!(["7:INBOX"]);
+    p["addLabelIds"] = json!([]);
+    p["removeLabelIds"] = json!(["INBOX", "UNREAD"]);
+    super::super::call("imap.modify", &p).await.unwrap();
+    peer.await.unwrap();
+}
+#[tokio::test]
+async fn archive_splits_one_batch_across_the_years_its_messages_belong_to() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut w: Wire = BufReader::new(Box::new(socket));
+        initialize(&mut w).await;
+        for wanted in [
+            "O1 SELECT \"INBOX\"\r\n",
+            "O1 UID STORE 7,9 +FLAGS.SILENT (\\Seen)\r\n",
+        ] {
+            assert_eq!(line(&mut w).await.unwrap(), wanted.as_bytes());
+            write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        }
+        assert_eq!(
+            line(&mut w).await.unwrap(),
+            b"O1 UID FETCH 7,9 (UID INTERNALDATE)\r\n".as_slice()
+        );
+        write(
+            &mut w,
+            b"* 1 FETCH (UID 7 INTERNALDATE \"01-Jan-2018 00:00:00 +0000\")\r\n\
+              * 2 FETCH (UID 9 INTERNALDATE \"01-Jan-2026 00:00:00 +0000\")\r\n\
+              O1 OK done\r\n",
+        )
+        .await
+        .unwrap();
+        // Buckets are visited in year order: 2018's messages move before 2026's.
+        for wanted in [
+            "O1 CREATE \"Archive/2018\"\r\n",
+            "O1 UID COPY 7 \"Archive/2018\"\r\n",
+            "O1 UID STORE 7 +FLAGS.SILENT (\\Deleted)\r\n",
+            "O1 UID EXPUNGE 7\r\n",
+            "O1 CREATE \"Archive/2026\"\r\n",
+            "O1 UID COPY 9 \"Archive/2026\"\r\n",
+            "O1 UID STORE 9 +FLAGS.SILENT (\\Deleted)\r\n",
+            "O1 UID EXPUNGE 9\r\n",
+        ] {
+            assert_eq!(line(&mut w).await.unwrap(), wanted.as_bytes());
+            write(&mut w, b"O1 OK done\r\n").await.unwrap();
+        }
+    });
+    let mut p = params(port);
+    p["ids"] = json!(["7:INBOX", "9:INBOX"]);
     p["addLabelIds"] = json!([]);
     p["removeLabelIds"] = json!(["INBOX", "UNREAD"]);
     super::super::call("imap.modify", &p).await.unwrap();

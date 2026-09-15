@@ -305,6 +305,67 @@ pub(super) fn resolve(boxes: &Mailboxes, name: &str) -> Result<String> {
         Ok(name.into())
     }
 }
+// The delimiter a server put between an existing folder's own path segments,
+// so a new child of it is named the way this server nests folders — never
+// guessed, and never "/" when a server uses "." or nothing at all.
+pub(super) fn delimiter_of(boxes: &Mailboxes, name: &str) -> String {
+    boxes
+        .folders
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))
+        .map(|f| f.delimiter.clone())
+        .unwrap_or_default()
+}
+pub(super) fn exists(boxes: &Mailboxes, name: &str) -> bool {
+    boxes
+        .folders
+        .iter()
+        .any(|f| f.name.eq_ignore_ascii_case(name))
+}
+// A live LIST, for the one moment a snapshot cannot answer: whether a folder
+// another concurrent archive just created already exists, so this call joins
+// it instead of failing a CREATE race.
+pub(super) async fn folder_listed(w: &mut Wire, name: &str) -> Result<bool> {
+    let data = command(w, &format!("LIST \"\" {}", quote(name)?)).await?;
+    for line in nodes(&data)? {
+        if line.len() >= 5 && line[0].is("*") && line[1].is("LIST") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+// UID -> the year its INTERNALDATE falls in, for routing an archived message
+// into the yearly subfolder it belongs under rather than the year it happens
+// to be archived in.
+pub(super) fn fetch_years(data: &[u8]) -> Result<BTreeMap<u32, i32>> {
+    use chrono::Datelike;
+    let mut out = BTreeMap::new();
+    for row in nodes(data)? {
+        if row.len() < 4 || !row[0].is("*") || !row[2].is("FETCH") {
+            continue;
+        }
+        let fields = row[3].list();
+        let mut uid = None;
+        let mut year = None;
+        let mut i = 0;
+        while i + 1 < fields.len() {
+            let key = &fields[i];
+            let value = &fields[i + 1];
+            if key.is("UID") {
+                uid = value.number();
+            } else if key.is("INTERNALDATE") {
+                year = chrono::DateTime::parse_from_str(&value.string()?, "%d-%b-%Y %H:%M:%S %z")
+                    .ok()
+                    .map(|d| d.year());
+            }
+            i += 2;
+        }
+        if let Some(uid) = uid {
+            out.insert(uid, year.unwrap_or_else(|| chrono::Utc::now().year()));
+        }
+    }
+    Ok(out)
+}
 pub(super) fn mailbox_name(name: &str) -> String {
     let mut out = String::new();
     let mut rest = name;

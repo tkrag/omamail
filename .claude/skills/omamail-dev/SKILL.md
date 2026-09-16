@@ -77,29 +77,51 @@ make test           # test-rust + test-js + test-shell + test-qml
 make validate        # test + qml-check + `omarchy plugin validate .`
 ```
 
-`test-js` (`node ui/tests/*.js`, no build step) and `test-qml` need only
-`node`, already present. `qml-check` needs `qmllint` from Qt, which is **not**
-installed in this environment — skip it if you haven't touched `ui/`, and say
-so explicitly if you have and couldn't verify it.
+`test-js` (`node ui/tests/*.js`, no build step) needs only `node`, already
+present. `qml-check` and `test-qml` need Qt 6's `qmllint`/`qmltestrunner` —
+these **are** installed here, just not on `PATH`: the Makefile already points
+`QMLLINT` at `/usr/lib/qt6/bin/qmllint`, and `QMLTESTRUNNER` falls back to
+`/usr/lib/qt6/bin/qmltestrunner` when neither `qmltestrunner6` nor
+`qmltestrunner` resolves on `PATH`, so plain `make qml-check` / `make
+test-qml` (or `python3 tests/run_qml_native.py /usr/lib/qt6/bin/qmltestrunner
+-input ui/tests/qml`) work without extra setup. Always run these after
+touching `ui/` — don't assume Qt tooling is unavailable without checking
+`/usr/lib/qt6/bin/` first.
 
 `make test-rust` is just `cargo test --locked --features
 integration-test-credentials` — always pass that feature flag, or IMAP/JMAP
 integration tests that exercise real credential storage fail with
 `auth_signed_out` for reasons that have nothing to do with your change.
 
-## Running a dev build against the live Omarchy shell
+## Running a local build against the live Omarchy shell
 
-```sh
-./dev run
-```
+**Use `make install`, not `./dev run`, unless you specifically need the
+`OMAMAIL_BIN` override.** `make install` (→ `install-backend-local`, which
+builds `--release` and runs `python3 scripts/backend-runtime.py
+install-local`, then `scripts/link-plugin.sh`) does three things: builds a
+release binary, installs it as *the* backend Omarchy launches (replacing the
+Marketplace one), and symlinks `~/.config/omarchy/plugins/omamail` to this
+checkout so the QML/JS also comes from here — then restarts the shell for
+you. This is what the Makefile itself calls out as "development only: the
+Marketplace installs the plugin for ordinary users," i.e. the sanctioned way
+to run your own build day to day. Revert with `make install-plugin` (wipes
+the runtime and reinstalls the pinned release fresh) or manually via
+`python3 scripts/backend-runtime.py uninstall`.
 
-This builds the backend and prints an `OMAMAIL_BIN=...` path — it does
-**not** touch the Marketplace-installed runtime. To actually use that build:
-export `OMAMAIL_BIN` in the environment that starts `omarchy-shell`, restart
-the shell through your normal session method, then reopen the plugin with
-`omarchy shell shell toggle omamail '{}'`. `make install` (→
-`install-backend-local` + `scripts/link-plugin.sh`) swaps in a dev build more
-persistently; `make install-plugin` resets to a clean installed state.
+`./dev run` only builds a debug binary and prints `OMAMAIL_BIN=<path>` — it
+changes nothing by itself. That variable has to reach the **Quickshell
+process's own environment** (`ui/Service.qml` reads it via
+`Quickshell.env("OMAMAIL_BIN")`), and `omarchy restart shell` deliberately
+launches the shell through Hyprland (`hyprctl dispatch
+'hl.dsp.exec_cmd("omarchy-launch-shell")'`) specifically so it inherits "the
+canonical session environment, not transient variables from a terminal" (see
+`omarchy-restart-shell`'s own comment) — so `export OMAMAIL_BIN=...` in a
+terminal and then restarting the shell does **not** pick it up. Reaching for
+`OMAMAIL_BIN` for real means getting it into Hyprland's own process
+environment (e.g. an `env =` line in the Hyprland config, which needs a
+fresh Hyprland session to take effect) — heavier than it's worth for a
+single test. `make install` sidesteps all of this because the resulting
+binary needs no environment variable at all.
 
 ## IMAP folder model, briefly
 
@@ -114,6 +136,41 @@ destination folder. `resolve(boxes, "\\Archive")` is the one sanctioned way
 to find "the" archive folder — do not walk `Mailboxes.folders` directly from
 outside `read.rs`; add a narrow `pub(super)` accessor instead (see
 `exists()`/`delimiter_of()`/`folder_listed()` for the pattern).
+
+## Credential storage and the account-startup read
+
+Rust (`src/auth/credentials.rs` → `src/credentials/`) owns the platform
+keyring; on Linux that's `src/credentials/secret_service.rs` over D-Bus. QML
+never sees a secret directly. Separately, `ui/Service.qml::restoreAccountRegistry()`
+reads the account *list itself* (`accounts.read`, emails/hosts/labels — no
+secrets) from a plain watched file; that read now retries a few times before
+falling back to onboarding, specifically because it can lose a race at login
+(see below) and used to strand a real, already-configured account behind the
+"Add a mailbox" screen forever with no retry. If accounts.json has a real
+account but the app shows onboarding, that startup race — not a lost
+password — is the first thing to suspect; check `omamail accounts list
+--json` against the live app's state before assuming a credential is gone.
+
+**This machine specifically** has SDDM autologin enabled
+(`/etc/sddm.conf.d/autologin.conf`), which skips the login password
+`pam_gnome_keyring` would otherwise use to unlock the login keyring — so the
+keyring (and anything reading from it right after boot) can start locked for
+a few seconds every session. That's a system-level interaction, not
+omamail's fault, but omamail's *own* one-shot startup reads were not
+resilient to it before the retry fix above.
+
+Also on this machine: `gnome-keyring-daemon` itself crashes somewhat
+regularly (`gkd_secret_service_get_pkcs11_session: assertion 'client'
+failed`, cascading to a fatal `g_variant_new` type mismatch) — a known,
+longstanding upstream bug ([Debian #1147303](http://www.mail-archive.com/debian-bugs-dist@lists.debian.org/msg2121437.html),
+[GNOME GitLab #144](https://gitlab.gnome.org/GNOME/gnome-keyring/-/work_items/144))
+triggered by concurrent Secret Service access. `secret_service.rs` opens a
+brand-new D-Bus connection and DH-encrypted session on every single
+credential lookup rather than reusing one, which plausibly exercises that
+race more than apps holding a single session — worth fixing (cache/reuse the
+session) as a follow-up, but not yet done; not something fixable in omamail
+alone since the crash is inside the daemon's own code, and nothing here
+duplicates an existing report on either tracker as of 2026-09-16.
 
 ## Security and commit conventions (from `AGENTS.md`, condensed)
 
@@ -132,10 +189,16 @@ outside `read.rs`; add a narrow `pub(super)` accessor instead (see
 
 ## This fork's own changes
 
-- `feature/archive-year-subfolders` — the IMAP archive shortcut ("e") now
-  routes each message into `<ArchiveRoot>/<year>` (the message's own date,
-  not the archive date), creating the year folder on first use, to match a
-  long-lived `Archives/<year>` layout instead of one ever-growing mailbox.
-  See `src/providers/imap/mutation.rs` (year bucketing, folder-create-then-
-  move) and `src/providers/imap/read.rs` (`fetch_years`, `delimiter_of`,
-  `exists`, `folder_listed`).
+- PR #1 (merged) — the IMAP archive shortcut ("e") now routes each message
+  into `<ArchiveRoot>/<year>` (the message's own date, not the archive date),
+  creating the year folder on first use, to match a long-lived
+  `Archives/<year>` layout instead of one ever-growing mailbox. See
+  `src/providers/imap/mutation.rs` (year bucketing, folder-create-then-move)
+  and `src/providers/imap/read.rs` (`fetch_years`, `delimiter_of`, `exists`,
+  `folder_listed`).
+- PR #3 — `restoreAccountRegistry()` in `ui/Service.qml` retries a failed
+  first `accounts.read` before falling back to onboarding. See "Credential
+  storage and the account-startup read" above.
+- Not yet done, worth picking up later: cache/reuse one Secret Service
+  session in `src/credentials/secret_service.rs` instead of opening a fresh
+  one per credential lookup — see the gnome-keyring section above.

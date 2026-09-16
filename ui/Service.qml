@@ -634,6 +634,13 @@ Item {
   property bool accountsReading: false
   property bool accountsReloadQueued: false
   property string accountsRevision: ""
+  // A failed first read is often just the desktop still settling at login —
+  // a locked keyring, a watched file mid-write — not truly no accounts. Retry
+  // briefly before accepting the placeholder that starts onboarding, so a
+  // transient race at startup doesn't strand a real account behind it for
+  // the rest of the session.
+  property int accountsReadRetries: 0
+  readonly property int accountsReadMaxRetries: 5
 
   readonly property int accountCount: Accounts.count(accountList)
   readonly property bool hasSavedAccounts: Accounts.hasSavedAccounts(accountList)
@@ -1085,16 +1092,32 @@ Item {
       root.accountsReloadQueued = false
       if (!error && result && !root.accountsWriting && !root.accountsSaveQueued
           && (!root.accountsLoaded || root.accountsRevision !== result.revision)) {
+        root.accountsReadRetries = 0
         root.accountsRevision = String(result.revision || "")
         root.applyAccounts(JSON.stringify(result.registry))
       } else if (error && !root.accountsLoaded) {
-        // First-run storage failure still settles the registry with a local
-        // placeholder. Cold-start notification routing can then fall back to
-        // the ordinary window instead of waiting forever for a missing read.
-        root.applyAccounts("")
+        if (!reload && root.accountsReadRetries < root.accountsReadMaxRetries) {
+          // The desktop may still be settling at login — a keyring not yet
+          // unlocked, a watched file mid-write. Retry briefly before
+          // accepting a real account never existed.
+          root.accountsReadRetries++
+          accountsReadRetryTimer.restart()
+        } else {
+          // First-run storage failure, or retries exhausted, still settles
+          // the registry with a local placeholder. Cold-start notification
+          // routing can then fall back to the ordinary window instead of
+          // waiting forever for a missing read.
+          root.applyAccounts("")
+        }
       }
       if (reload) root.restoreAccountRegistry()
     })
+  }
+
+  Timer {
+    id: accountsReadRetryTimer
+    interval: 1000
+    onTriggered: root.restoreAccountRegistry()
   }
 
   function applyAccounts(raw) {

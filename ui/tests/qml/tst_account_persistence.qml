@@ -85,6 +85,70 @@ Item {
       compare(svc.accountList.accounts[0].label, "Native change")
       compare(svc.accountsReading, false)
     }
+    function test_failed_first_read_retries_before_settling_on_a_placeholder() {
+      // A fresh service with no BackendFixture auto-responder attached, so
+      // the very first accounts.read is answered by hand — this exercises
+      // the boot-time race (keyring not yet unlocked, a watched file mid-
+      // write) where that first read fails before any real account has ever
+      // loaded.
+      var svc = createTemporaryObject(serviceComponent, parent);
+      verify(svc !== null);
+      svc.backendRuntime.requiredVersion = "0.0.0";
+      svc.backendRuntime.requiredApiVersion = 1;
+      svc.backendRuntime.latestApiVersion = 1;
+      svc.backendRuntime.unreleasedMethods = [];
+      svc.backendRuntime.executable = "/synthetic/runtime/bin/omamail";
+      svc.backendRuntime.state = "ready";
+      svc.backend.protocolInfo = { apiVersion: 1, protocol: 1, version: "0.0.0" };
+      svc.backend.connected = true;
+      compare(svc.accountsLoaded, false);
+
+      var first = latestRequest(svc, "accounts.read");
+      verify(first !== "");
+      svc.backend.receive(JSON.stringify({jsonrpc:"2.0",id:first,error:{code:-32000,message:"synthetic_failure"}}));
+      // Retried, not settled on the empty placeholder yet.
+      compare(svc.accountsLoaded, false);
+      compare(svc.accountsReadRetries, 1);
+
+      wait(1100);
+
+      var second = latestRequest(svc, "accounts.read");
+      verify(second !== first);
+      var list = Accounts.emptyList();
+      list = Accounts.add(list, { provider: "imap", email: "recovered@example.com" });
+      svc.backend.receive(JSON.stringify({jsonrpc:"2.0",id:second,result:{registry:list,revision:"r1"}}));
+      compare(svc.accountsLoaded, true);
+      compare(svc.accountList.accounts.length, 1);
+      compare(svc.accountList.accounts[0].email, "recovered@example.com");
+      compare(svc.accountsReadRetries, 0);
+    }
+    function test_read_failure_settles_on_a_placeholder_once_retries_are_exhausted() {
+      // Rather than looping through every retry in real time (racy against
+      // the component's own deferred startup call), start one retry short of
+      // the limit and confirm the very next failure gives up rather than
+      // scheduling another retry.
+      var svc = createTemporaryObject(serviceComponent, parent);
+      verify(svc !== null);
+      svc.backendRuntime.requiredVersion = "0.0.0";
+      svc.backendRuntime.requiredApiVersion = 1;
+      svc.backendRuntime.latestApiVersion = 1;
+      svc.backendRuntime.unreleasedMethods = [];
+      svc.backendRuntime.executable = "/synthetic/runtime/bin/omamail";
+      svc.backendRuntime.state = "ready";
+      svc.backend.protocolInfo = { apiVersion: 1, protocol: 1, version: "0.0.0" };
+      svc.backend.connected = true;
+
+      var first = latestRequest(svc, "accounts.read");
+      verify(first !== "");
+      svc.accountsReadRetries = svc.accountsReadMaxRetries;
+      svc.backend.receive(JSON.stringify({jsonrpc:"2.0",id:first,error:{code:-32000,message:"synthetic_failure"}}));
+      // Every retry is genuinely exhausted, not a permanently broken account:
+      // a still-empty registry settles on the placeholder so onboarding can
+      // still be reached, exactly as a real first run always has.
+      compare(svc.accountsLoaded, true);
+      compare(svc.accountList.accounts.length, 1);
+      compare(svc.accountList.accounts[0].pending, true);
+    }
     function test_queued_profile_correction_is_saved_after_the_old_write() {
       var svc = create();
       svc.saveAccounts();

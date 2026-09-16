@@ -77,10 +77,16 @@ make test           # test-rust + test-js + test-shell + test-qml
 make validate        # test + qml-check + `omarchy plugin validate .`
 ```
 
-`test-js` (`node ui/tests/*.js`, no build step) and `test-qml` need only
-`node`, already present. `qml-check` needs `qmllint` from Qt, which is **not**
-installed in this environment — skip it if you haven't touched `ui/`, and say
-so explicitly if you have and couldn't verify it.
+`test-js` (`node ui/tests/*.js`, no build step) needs only `node`, already
+present. `qml-check` and `test-qml` need Qt 6's `qmllint`/`qmltestrunner` —
+these **are** installed here, just not on `PATH`: the Makefile already points
+`QMLLINT` at `/usr/lib/qt6/bin/qmllint`, and `QMLTESTRUNNER` falls back to
+`/usr/lib/qt6/bin/qmltestrunner` when neither `qmltestrunner6` nor
+`qmltestrunner` resolves on `PATH`, so plain `make qml-check` / `make
+test-qml` (or `python3 tests/run_qml_native.py /usr/lib/qt6/bin/qmltestrunner
+-input ui/tests/qml`) work without extra setup. Always run these after
+touching `ui/` — don't assume Qt tooling is unavailable without checking
+`/usr/lib/qt6/bin/` first.
 
 `make test-rust` is just `cargo test --locked --features
 integration-test-credentials` — always pass that feature flag, or IMAP/JMAP
@@ -131,6 +137,41 @@ to find "the" archive folder — do not walk `Mailboxes.folders` directly from
 outside `read.rs`; add a narrow `pub(super)` accessor instead (see
 `exists()`/`delimiter_of()`/`folder_listed()` for the pattern).
 
+## Credential storage and the account-startup read
+
+Rust (`src/auth/credentials.rs` → `src/credentials/`) owns the platform
+keyring; on Linux that's `src/credentials/secret_service.rs` over D-Bus. QML
+never sees a secret directly. Separately, `ui/Service.qml::restoreAccountRegistry()`
+reads the account *list itself* (`accounts.read`, emails/hosts/labels — no
+secrets) from a plain watched file; that read now retries a few times before
+falling back to onboarding, specifically because it can lose a race at login
+(see below) and used to strand a real, already-configured account behind the
+"Add a mailbox" screen forever with no retry. If accounts.json has a real
+account but the app shows onboarding, that startup race — not a lost
+password — is the first thing to suspect; check `omamail accounts list
+--json` against the live app's state before assuming a credential is gone.
+
+**This machine specifically** has SDDM autologin enabled
+(`/etc/sddm.conf.d/autologin.conf`), which skips the login password
+`pam_gnome_keyring` would otherwise use to unlock the login keyring — so the
+keyring (and anything reading from it right after boot) can start locked for
+a few seconds every session. That's a system-level interaction, not
+omamail's fault, but omamail's *own* one-shot startup reads were not
+resilient to it before the retry fix above.
+
+Also on this machine: `gnome-keyring-daemon` itself crashes somewhat
+regularly (`gkd_secret_service_get_pkcs11_session: assertion 'client'
+failed`, cascading to a fatal `g_variant_new` type mismatch) — a known,
+longstanding upstream bug ([Debian #1147303](http://www.mail-archive.com/debian-bugs-dist@lists.debian.org/msg2121437.html),
+[GNOME GitLab #144](https://gitlab.gnome.org/GNOME/gnome-keyring/-/work_items/144))
+triggered by concurrent Secret Service access. `secret_service.rs` opens a
+brand-new D-Bus connection and DH-encrypted session on every single
+credential lookup rather than reusing one, which plausibly exercises that
+race more than apps holding a single session — worth fixing (cache/reuse the
+session) as a follow-up, but not yet done; not something fixable in omamail
+alone since the crash is inside the daemon's own code, and nothing here
+duplicates an existing report on either tracker as of 2026-09-16.
+
 ## Security and commit conventions (from `AGENTS.md`, condensed)
 
 - Credentials never cross a process boundary; nothing sensitive belongs in
@@ -148,10 +189,16 @@ outside `read.rs`; add a narrow `pub(super)` accessor instead (see
 
 ## This fork's own changes
 
-- `feature/archive-year-subfolders` — the IMAP archive shortcut ("e") now
-  routes each message into `<ArchiveRoot>/<year>` (the message's own date,
-  not the archive date), creating the year folder on first use, to match a
-  long-lived `Archives/<year>` layout instead of one ever-growing mailbox.
-  See `src/providers/imap/mutation.rs` (year bucketing, folder-create-then-
-  move) and `src/providers/imap/read.rs` (`fetch_years`, `delimiter_of`,
-  `exists`, `folder_listed`).
+- PR #1 (merged) — the IMAP archive shortcut ("e") now routes each message
+  into `<ArchiveRoot>/<year>` (the message's own date, not the archive date),
+  creating the year folder on first use, to match a long-lived
+  `Archives/<year>` layout instead of one ever-growing mailbox. See
+  `src/providers/imap/mutation.rs` (year bucketing, folder-create-then-move)
+  and `src/providers/imap/read.rs` (`fetch_years`, `delimiter_of`, `exists`,
+  `folder_listed`).
+- PR #3 — `restoreAccountRegistry()` in `ui/Service.qml` retries a failed
+  first `accounts.read` before falling back to onboarding. See "Credential
+  storage and the account-startup read" above.
+- Not yet done, worth picking up later: cache/reuse one Secret Service
+  session in `src/credentials/secret_service.rs` instead of opening a fresh
+  one per credential lookup — see the gnome-keyring section above.
